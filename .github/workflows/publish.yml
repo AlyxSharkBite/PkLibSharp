@@ -1,0 +1,120 @@
+name: Publish to NuGet.org
+
+# Publishes the exact package that was attached to a GitHub release. It does not build one: the
+# assets uploaded by package.yml are downloaded and pushed as-is, so what reaches NuGet.org is
+# byte for byte what the release carries and what the tests passed against.
+#
+# Authentication is trusted publishing (OIDC). NuGet.org verifies a short-lived, GitHub-signed
+# token against a policy naming this repository, this workflow file and the release environment,
+# then issues an API key valid for one hour. There is no long-lived secret to leak or rotate.
+#
+# Publishing to NuGet.org cannot be undone: a package can be unlisted but never deleted. Two
+# deliberate human steps therefore stand in front of it — publishing the GitHub release, and
+# approving the release environment.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish, for example v1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  publish:
+    name: Push to NuGet.org
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Gates the job on the required reviewer configured for this environment, and scopes the
+    # trusted publishing policy: a token from any other environment will not be accepted.
+    environment:
+      name: release
+      url: https://www.nuget.org/packages/PkLibSharp
+
+    permissions:
+      # Lets GitHub mint the OIDC token that NuGet.org exchanges for a short-lived API key.
+      id-token: write
+      # Reading the release assets to publish.
+      contents: read
+
+    steps:
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download the release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts
+          gh release download "$TAG" --repo "${GITHUB_REPOSITORY}" --dir artifacts --pattern '*.nupkg' --pattern '*.snupkg'
+          ls -l artifacts
+
+      - name: Verify the assets before pushing
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # The tag is the source of truth for the version, so confirm the package agrees with it
+          # rather than trusting the filename. Publishing the wrong version is not reversible.
+          version="${TAG#v}"
+          nupkg="artifacts/PkLibSharp.${version}.nupkg"
+
+          if [ ! -f "$nupkg" ]; then
+            echo "::error::Release $TAG has no asset named PkLibSharp.${version}.nupkg"
+            exit 1
+          fi
+
+          if ! unzip -p "$nupkg" 'PkLibSharp.nuspec' | grep -q "<version>${version}</version>"; then
+            echo "::error::$nupkg does not declare version ${version}."
+            exit 1
+          fi
+
+          # A package missing its licence would be published without the notice the MIT terms of
+          # both this work and the upstream PKLib require.
+          for entry in LICENSE README.md lib/net10.0/PkLibSharp.dll; do
+            if ! unzip -Z1 "$nupkg" | grep -qx "$entry"; then
+              echo "::error::$nupkg is missing $entry"
+              exit 1
+            fi
+          done
+
+          echo "Verified PkLibSharp ${version}, ready to push."
+
+      - name: Exchange the OIDC token for a short-lived NuGet API key
+        # Requested immediately before the push: NuGet's temporary keys last one hour, and each
+        # token buys exactly one key.
+        id: login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push
+        # The matching .snupkg is picked up automatically from the same directory.
+        # --skip-duplicate makes a re-run after a partial failure safe rather than an error.
+        run: |
+          set -euo pipefail
+
+          dotnet nuget push 'artifacts/*.nupkg' \
+            --api-key '${{ steps.login.outputs.NUGET_API_KEY }}' \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
