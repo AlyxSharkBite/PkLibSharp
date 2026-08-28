@@ -1,0 +1,183 @@
+name: Package
+
+# Builds the NuGet package, and proves it is the artifact that passed the tests: the solution is
+# built once, tested, then packed with --no-build, so the assembly inside the .nupkg is byte for
+# byte the one the test run exercised.
+#
+# Deliberately stops at producing artifacts. Pushing to NuGet.org is a separate, outward-facing
+# step that needs an API key secret this workflow does not have and does not ask for.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  TESTINGPLATFORM_TELEMETRY_OPTOUT: 1
+
+jobs:
+  package:
+    name: Build and pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        # Same locked mode as the rest of CI: the package must be built from exactly the
+        # dependency set that was reviewed and committed.
+        run: dotnet restore --locked-mode
+
+      - name: Determine version
+        id: version
+        # A v* tag is authoritative and produces a release version. Anything else produces a
+        # prerelease built from the project's own version, the run number and the commit, so
+        # every main build and pull request yields a uniquely identifiable package.
+        run: |
+          set -euo pipefail
+
+          base="$(dotnet msbuild PkLibSharp/PkLibSharp.csproj -getProperty:Version -v:q --nologo)"
+          base="$(echo "$base" | tr -d '[:space:]')"
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+
+            if [ "$version" != "$base" ]; then
+              echo "::warning::Tag ${GITHUB_REF_NAME} produces version ${version}, but PkLibSharp.csproj declares ${base}. The tag wins; bump the csproj to keep them in step."
+            fi
+          else
+            version="${base}-ci.${GITHUB_RUN_NUMBER}.g$(git rev-parse --short=7 HEAD)"
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Packaging version ${version}"
+
+      - name: Build
+        run: |
+          dotnet build --configuration Release --no-restore -warnaserror \
+            -p:Version=${{ steps.version.outputs.version }} \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Test
+        # Runs before packing so a failing suite cannot produce a package. No --nologo: xunit v3
+        # runs on Microsoft.Testing.Platform, whose dotnet test mode rejects that option.
+        run: dotnet test --configuration Release --no-build
+
+      - name: Pack
+        # --no-build guarantees the packaged assembly is the tested one rather than a rebuild.
+        # ContinuousIntegrationBuild normalises paths recorded in the PDB; PublishRepositoryUrl
+        # and EmbedUntrackedSources make the symbol package usable for SourceLink debugging.
+        run: |
+          dotnet pack PkLibSharp/PkLibSharp.csproj --configuration Release --no-build \
+            -p:Version=${{ steps.version.outputs.version }} \
+            -p:ContinuousIntegrationBuild=true \
+            -p:PublishRepositoryUrl=true \
+            -p:EmbedUntrackedSources=true \
+            --include-symbols -p:SymbolPackageFormat=snupkg \
+            --output artifacts
+
+      - name: Verify package contents
+        # A package that builds is not necessarily a package that is correct. Assert the pieces
+        # that are easy to lose silently: the licence and readme that the MIT terms and the
+        # gallery listing depend on, the XML documentation, and the declared version.
+        run: |
+          set -euo pipefail
+
+          version='${{ steps.version.outputs.version }}'
+          nupkg="artifacts/PkLibSharp.${version}.nupkg"
+          snupkg="artifacts/PkLibSharp.${version}.snupkg"
+
+          for file in "$nupkg" "$snupkg"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Expected $file was not produced."
+              exit 1
+            fi
+          done
+
+          contents="$(unzip -Z1 "$nupkg")"
+          echo "$contents"
+
+          for entry in LICENSE README.md lib/net10.0/PkLibSharp.dll lib/net10.0/PkLibSharp.xml; do
+            if ! echo "$contents" | grep -qx "$entry"; then
+              echo "::error::$nupkg is missing $entry"
+              exit 1
+            fi
+          done
+
+          if ! unzip -p "$nupkg" 'PkLibSharp.nuspec' | grep -q "<version>${version}</version>"; then
+            echo "::error::$nupkg does not declare version ${version}."
+            exit 1
+          fi
+
+          if ! unzip -Z1 "$snupkg" | grep -qx 'lib/net10.0/PkLibSharp.pdb'; then
+            echo "::error::$snupkg is missing the debug symbols."
+            exit 1
+          fi
+
+          echo "Package verified: PkLibSharp ${version}"
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: PkLibSharp-${{ steps.version.outputs.version }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach to draft release
+    # Only for v* tags. Pull requests and ordinary pushes to main stop at the artifact above.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      # Required to create the release and upload assets to it.
+      contents: write
+
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: PkLibSharp-${{ needs.package.outputs.version }}
+          path: artifacts
+
+      - name: Create draft release
+        # Created as a draft on purpose: pushing a tag builds and attaches the package, but
+        # publishing stays a deliberate human step. Drop --draft to publish automatically.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          gh release create "${GITHUB_REF_NAME}" artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "PkLibSharp ${{ needs.package.outputs.version }}" \
+            --generate-notes \
+            --draft
