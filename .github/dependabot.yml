@@ -31,5 +31,4 @@ updates:
       test-dependencies:
         patterns:
           - "xunit*"
-          - "Microsoft.NET.Test.Sdk"
-          - "coverlet*"
+          - "Microsoft.Testing.*"

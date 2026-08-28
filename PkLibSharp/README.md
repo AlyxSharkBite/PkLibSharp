@@ -140,7 +140,8 @@ require.
 dotnet test
 ```
 
-`PkLibSharp.Tests` mirrors the library's folder layout. The suite is 966 tests, most of them a
+`PkLibSharp.Tests` mirrors the library's folder layout and runs on xunit v3 via
+Microsoft.Testing.Platform, which `global.json` selects. The suite is 966 tests, most of them a
 theory over 18 payloads crossed with all three dictionary sizes and both compression modes. Beyond
 round-tripping, it pins the encoder and decoder to a stream assembled by hand from the format
 definition, so a matching pair of bugs in the two halves cannot cancel out; checks the CRC against a
