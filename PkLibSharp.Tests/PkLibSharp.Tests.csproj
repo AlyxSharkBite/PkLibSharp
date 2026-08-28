@@ -5,13 +5,16 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <!-- xunit v3 test projects are console applications rather than class libraries: the test
+         host is Microsoft.Testing.Platform, linked into the test assembly itself. The runner is
+         selected in global.json, which the .NET 10 SDK requires for MTP-based projects. -->
+    <OutputType>Exe</OutputType>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="coverlet.collector" Version="10.0.1" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
-    <PackageReference Include="xunit" Version="2.9.3" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0" />
+    <!-- xunit.v3 carries its own Microsoft.Testing.Platform runner, so neither
+         Microsoft.NET.Test.Sdk nor the VSTest adapter is needed any more. -->
+    <PackageReference Include="xunit.v3" Version="4.0.0" />
   </ItemGroup>
 
   <ItemGroup>

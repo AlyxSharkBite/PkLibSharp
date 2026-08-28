@@ -22,6 +22,7 @@ env:
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  TESTINGPLATFORM_TELEMETRY_OPTOUT: 1
 
 jobs:
   build-and-test:
@@ -42,11 +43,15 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Restore
-        run: dotnet restore
+        # Locked mode fails the build if the committed packages.lock.json does not match the
+        # projects' declared dependencies, so an unreviewed package cannot slip into CI.
+        run: dotnet restore --locked-mode
 
       - name: Build
         # New warnings fail the build. The tree is warning free today, so this stays honest.
         run: dotnet build --configuration Release --no-restore -warnaserror
 
       - name: Test
+        # No --nologo here: xunit v3 runs on Microsoft.Testing.Platform, whose dotnet test mode
+        # rejects that VSTest-era option with exit code 5 (invalid arguments).
         run: dotnet test --configuration Release --no-build --verbosity normal

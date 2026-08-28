@@ -1,0 +1,20 @@
+<Project>
+
+  <!-- Settings shared by every project in the repository. -->
+
+  <PropertyGroup>
+    <!-- Write a packages.lock.json next to each project, recording the exact resolved version and
+         content hash of every dependency, direct and transitive. Combined with restoring in locked
+         mode on CI, this means a build fails rather than silently picking up a different package
+         than the one that was reviewed: a re-published version, a substituted package, or an
+         unnoticed transitive bump. The lock files are committed on purpose. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+
+    <!-- Audit dependencies against the NuGet advisory database during restore. The default only
+         covers direct references; "all" includes transitive ones, which is where most of the risk
+         actually sits. "low" reports every severity rather than only the loud ones. -->
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <NuGetAuditLevel>low</NuGetAuditLevel>
+  </PropertyGroup>
+
+</Project>
