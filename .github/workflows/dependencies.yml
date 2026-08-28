@@ -1,0 +1,108 @@
+name: SCA (dependencies)
+
+# Software composition analysis. Two complementary jobs:
+#
+#   vulnerable-packages  runs on a daily schedule as well as on change, because a dependency
+#                        becomes vulnerable when an advisory is published, not when this repo
+#                        is edited. A push-only scan would report clean for months while the
+#                        lock of a known-bad transitive package sat untouched.
+#
+#   dependency-review    blocks the pull request that would introduce the bad package, which
+#                        is cheaper than finding it on main afterwards.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  vulnerable-packages:
+    name: Known-vulnerable and deprecated packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Audit for known-vulnerable packages
+        run: |
+          set -uo pipefail
+          dotnet list package --vulnerable --include-transitive 2>&1 | tee vulnerable.txt
+          # `dotnet list package` exits 0 whether or not it found anything, so the report has
+          # to be inspected rather than trusted to set an exit code.
+          if grep -q "has the following vulnerable packages" vulnerable.txt; then
+            echo "::error::Known-vulnerable NuGet packages are present. See the report above."
+            exit 1
+          fi
+          echo "No known-vulnerable packages, including transitive ones."
+
+      - name: Report deprecated and outdated packages
+        # Informational: a deprecated package is a supply-chain risk (unmaintained, prone to
+        # takeover) but not an immediate vulnerability, so it warns rather than fails.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          dotnet list package --deprecated --include-transitive 2>&1 | tee deprecated.txt
+          if grep -q "has the following deprecated packages" deprecated.txt; then
+            echo "::warning::Deprecated NuGet packages are present. See the report above."
+          fi
+          dotnet list package --outdated --include-transitive 2>&1 | tee outdated.txt
+
+      - name: Upload dependency reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dependency-reports
+          path: |
+            vulnerable.txt
+            deprecated.txt
+            outdated.txt
+          retention-days: 30
+
+  dependency-review:
+    name: Review dependency changes in this PR
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # This project has almost no dependencies, so there is no reason to tolerate any
+          # severity. Raise this if the noise ever outweighs the signal.
+          fail-on-severity: low
+          # Flag licence changes too: an unexpected licence on a new transitive package is a
+          # useful signal that something was swapped underneath you.
+          comment-summary-in-pr: on-failure

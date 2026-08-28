@@ -1,0 +1,83 @@
+name: SAST (CodeQL)
+
+# Static analysis for injected backdoors, unsafe deserialisation, path traversal, injection sinks
+# and the like. Two languages are analysed:
+#
+#   csharp  - the library and test sources
+#   actions - the workflow files in this directory, which are themselves attacker-reachable
+#             (script injection through untrusted ${{ }} interpolation, over-broad permissions,
+#             mutable action references)
+#
+# The weekly schedule matters as much as the per-push run: CodeQL ships new queries continuously,
+# so code that was clean when merged gets re-examined against detections that did not exist yet.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '27 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      # Required to publish findings to the repository's Security tab.
+      security-events: write
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: csharp
+            build-mode: manual
+          - language: actions
+            build-mode: none
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET
+        if: matrix.language == 'csharp'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@486fec2a3ea2626afcd8c7e9208b4f515078dd7e # codeql-bundle-v2.26.4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Default is the "security" suite alone. security-extended adds lower-confidence
+          # security queries; security-and-quality adds correctness and maintainability rules.
+          queries: security-extended,security-and-quality
+
+      - name: Build
+        if: matrix.language == 'csharp'
+        run: dotnet build --configuration Release
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@486fec2a3ea2626afcd8c7e9208b4f515078dd7e # codeql-bundle-v2.26.4
+        with:
+          category: /language:${{ matrix.language }}

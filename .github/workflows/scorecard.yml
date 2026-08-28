@@ -1,0 +1,51 @@
+name: OpenSSF Scorecard
+
+# Scores the repository's own supply-chain posture rather than its code: are actions pinned to
+# immutable SHAs, are workflow permissions least-privilege, is branch protection on, are
+# dependencies kept current, is there a security policy. This is the check that would have
+# flagged the mutable `@v1` action reference behind the tj-actions/changed-files compromise.
+
+on:
+  branch_protection_rule:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '33 6 * * 2'
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      # Required to publish findings to the repository's Security tab.
+      security-events: write
+      # Required by the Branch-Protection check to read repository settings.
+      contents: read
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          # Left off on purpose: setting this to true publishes the results to the public
+          # OpenSSF dataset and API. Turn it on if you want the Scorecard badge; the findings
+          # land in the Security tab either way.
+          publish_results: false
+
+      - name: Upload results to the Security tab
+        uses: github/codeql-action/upload-sarif@486fec2a3ea2626afcd8c7e9208b4f515078dd7e # codeql-bundle-v2.26.4
+        with:
+          sarif_file: scorecard.sarif

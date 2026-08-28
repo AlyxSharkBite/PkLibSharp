@@ -1,0 +1,35 @@
+version: 2
+
+# Pinning actions to commit SHAs stops a tag from being repointed at malicious code, but it also
+# freezes you on whatever was current the day you pinned. Dependabot is the other half of that
+# trade: it raises PRs that move the pin forward, comment included, so the pins stay both
+# immutable and maintained.
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      # One PR for routine bumps; anything with a security advisory still comes through on its own.
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "nuget"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "nuget"
+    groups:
+      test-dependencies:
+        patterns:
+          - "xunit*"
+          - "Microsoft.NET.Test.Sdk"
+          - "coverlet*"
