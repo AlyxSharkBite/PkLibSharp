@@ -1,3 +1,7 @@
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
 namespace PkLibSharp;
 
 /// <summary>
@@ -164,30 +168,82 @@ internal sealed class ImplodeEngine
     /// <param name="bufferEnd">One past the last work buffer offset to index.</param>
     private void BuildHashTables(int bufferBegin, int bufferEnd)
     {
-        Array.Clear(_hashToIndex);
+        // Local copies keep the array references in registers through the hot loops.
+        byte[] buffer = _workBuffer;
+        ushort[] hashToIndex = _hashToIndex;
+        ushort[] hashOffsets = _hashOffsets;
+
+        Array.Clear(hashToIndex);
 
         // Step 1: count how often each byte pair hash occurs.
         for (int offset = bufferBegin; offset < bufferEnd; offset++)
         {
-            _hashToIndex[BytePairHash(offset)]++;
+            hashToIndex[(buffer[offset] * 4) + (buffer[offset + 1] * 5)]++;
         }
 
         // Step 2: turn the counts into a running total, so each entry holds the number of pairs
         // whose hash is less than or equal to its index.
         ushort totalSum = 0;
-        for (int hash = 0; hash < _hashToIndex.Length; hash++)
+        for (int hash = 0; hash < hashToIndex.Length; hash++)
         {
-            totalSum = (ushort)(totalSum + _hashToIndex[hash]);
-            _hashToIndex[hash] = totalSum;
+            totalSum = (ushort)(totalSum + hashToIndex[hash]);
+            hashToIndex[hash] = totalSum;
         }
 
         // Step 3: walking backwards and decrementing turns the running totals into the index of the
         // first occurrence of each hash, and leaves each hash's offsets in ascending order.
         for (int offset = bufferEnd - 1; offset >= bufferBegin; offset--)
         {
-            int hash = BytePairHash(offset);
-            _hashOffsets[--_hashToIndex[hash]] = (ushort)offset;
+            int hash = (buffer[offset] * 4) + (buffer[offset + 1] * 5);
+            hashOffsets[--hashToIndex[hash]] = (ushort)offset;
         }
+    }
+
+    /// <summary>
+    /// Counts how many bytes match between two positions in the work buffer, up to
+    /// <paramref name="maxLength"/> — the index of the first mismatch, exactly as a byte-at-a-time
+    /// loop would find it. Overlapping ranges are fine: both sides are only read.
+    /// </summary>
+    /// <remarks>
+    /// Compares eight bytes per step: the XOR of two 64-bit loads is zero when all eight bytes
+    /// agree, and the trailing-zero count of a non-zero XOR locates the first differing byte. On
+    /// x86-64 the JIT compiles this to unaligned 64-bit loads and the TZCNT instruction. Match
+    /// candidates are capped at 0x204 bytes, short enough that this beats both the byte loop it
+    /// replaces and a 32-byte AVX2 loop, whose setup costs more than it saves on typical matches.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int MatchLength(byte[] buffer, int first, int second, int maxLength)
+    {
+        // The work buffer's zeroed padding keeps all comparisons in range; the clamp is defensive.
+        int length = Math.Min(maxLength, buffer.Length - Math.Max(first, second));
+        int index = 0;
+
+        if (BitConverter.IsLittleEndian)
+        {
+            ref byte start = ref MemoryMarshal.GetArrayDataReference(buffer);
+
+            while (index + sizeof(ulong) <= length)
+            {
+                ulong difference =
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref start, first + index)) ^
+                    Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref start, second + index));
+
+                if (difference != 0)
+                {
+                    // On little-endian, the lowest differing byte is the first differing byte.
+                    return index + (BitOperations.TrailingZeroCount(difference) >> 3);
+                }
+
+                index += sizeof(ulong);
+            }
+        }
+
+        while (index < length && buffer[first + index] == buffer[second + index])
+        {
+            index++;
+        }
+
+        return index;
     }
 
     /// <summary>
@@ -223,39 +279,57 @@ internal sealed class ImplodeEngine
     /// <param name="bits">The value holding the bits to write.</param>
     private void OutputBits(int bitCount, uint bits)
     {
-        // Codes can be up to 16 bits wide, but only 8 bits can cross into a new byte at a time.
-        if (bitCount > 8)
+        byte[] outputBuffer = _outputBuffer;
+        int outputBits = _outputBits;
+        int outputBytes = _outputBytes;
+
+        // Codes can be up to 16 bits wide, but only 8 bits can cross into a new byte at a time, so
+        // wider codes take two rounds. This was a recursive call in the original; unrolled into a
+        // loop with the cursor fields kept in locals, since this runs for every literal emitted.
+        while (true)
         {
-            OutputBits(8, bits);
+            outputBuffer[outputBytes] |= (byte)(bits << outputBits);
+            int totalBits = outputBits + Math.Min(bitCount, 8);
+
+            if (totalBits > 8)
+            {
+                // Deliberately unmasked, as in the original: on a two-round code the spilled byte
+                // briefly carries bits belonging to the second round, which then ORs the same
+                // values over themselves.
+                outputBuffer[outputBytes + 1] = (byte)(bits >> (8 - outputBits));
+                outputBytes++;
+                outputBits = totalBits & 7;
+            }
+            else
+            {
+                outputBits = totalBits & 7;
+
+                if (outputBits == 0)
+                {
+                    outputBytes++;
+                }
+            }
+
+            if (outputBytes >= OutputFlushThreshold)
+            {
+                _outputBytes = outputBytes;
+                _outputBits = outputBits;
+                FlushOutputBuffer();
+                outputBytes = _outputBytes;
+                outputBits = _outputBits;
+            }
+
+            if (bitCount <= 8)
+            {
+                break;
+            }
+
             bits >>= 8;
             bitCount -= 8;
         }
 
-        int bitsAlreadyUsed = _outputBits;
-        _outputBuffer[_outputBytes] |= (byte)(bits << bitsAlreadyUsed);
-        _outputBits += bitCount;
-
-        if (_outputBits > 8)
-        {
-            _outputBytes++;
-            bits >>= 8 - bitsAlreadyUsed;
-            _outputBuffer[_outputBytes] = (byte)bits;
-            _outputBits &= 7;
-        }
-        else
-        {
-            _outputBits &= 7;
-
-            if (_outputBits == 0)
-            {
-                _outputBytes++;
-            }
-        }
-
-        if (_outputBytes >= OutputFlushThreshold)
-        {
-            FlushOutputBuffer();
-        }
+        _outputBytes = outputBytes;
+        _outputBits = outputBits;
     }
 
     /// <summary>
@@ -266,6 +340,18 @@ internal sealed class ImplodeEngine
     /// <returns>The length of the repetition found, or zero if there is none worth encoding.</returns>
     private int FindRepetition(int inputOffset)
     {
+        byte[] buffer = _workBuffer;
+        ushort[] hashOffsets = _hashOffsets;
+
+        // The chain scan below runs a handful of instructions per entry, so the three bounds checks
+        // it would otherwise carry are a measurable share of the whole compression. The unchecked
+        // reads are safe because every chain is terminated by the entry for inputOffset itself
+        // (indexed before this call, and >= the repetition limit), so hashOffsetIndex never leaves
+        // the table, and because every stored offset is at most 0x2204 while the buffer extends
+        // MaxRepetitionLength + 4 bytes further than that.
+        ref byte bufferRef = ref MemoryMarshal.GetArrayDataReference(buffer);
+        ref ushort hashOffsetsRef = ref MemoryMarshal.GetArrayDataReference(hashOffsets);
+
         int hash = BytePairHash(inputOffset);
         int hashOffsetIndex = _hashToIndex[hash];
 
@@ -274,9 +360,9 @@ internal sealed class ImplodeEngine
 
         // Skip occurrences that have fallen out of the dictionary, and remember where to resume
         // next time this hash is looked up.
-        if (_hashOffsets[hashOffsetIndex] < minimumHashOffset)
+        if (Unsafe.Add(ref hashOffsetsRef, hashOffsetIndex) < minimumHashOffset)
         {
-            while (_hashOffsets[hashOffsetIndex] < minimumHashOffset)
+            while (Unsafe.Add(ref hashOffsetsRef, hashOffsetIndex) < minimumHashOffset)
             {
                 hashOffsetIndex++;
             }
@@ -286,7 +372,7 @@ internal sealed class ImplodeEngine
 
         // A repetition must start strictly before this offset.
         int repetitionLimit = inputOffset - 1;
-        int previousRepetition = _hashOffsets[hashOffsetIndex];
+        int previousRepetition = Unsafe.Add(ref hashOffsetsRef, hashOffsetIndex);
 
         if (previousRepetition >= repetitionLimit)
         {
@@ -296,35 +382,32 @@ internal sealed class ImplodeEngine
         int repetitionLength = 1;
         int equalByteCount = 0;
 
-        // A matching hash is not a matching byte pair, so compare the bytes and measure the match.
+        // Hoisted out of the scan: the first byte of the sequence, and the byte a candidate must
+        // carry at position repetitionLength - 1 to have any chance of beating the current best.
+        byte firstByte = buffer[inputOffset];
+        byte lastByte = firstByte;
+        int lastByteOffset = 0;
+
+        // Every occurrence in this chain has the same byte pair hash (b0 * 4 + b1 * 5), so once the
+        // first bytes match, the second bytes must match as well — which is why two bytes can be
+        // counted before measuring on from the third, exactly as the original does.
         while (true)
         {
-            if (_workBuffer[inputOffset] == _workBuffer[previousRepetition] &&
-                _workBuffer[inputOffset + repetitionLength - 1] == _workBuffer[previousRepetition + repetitionLength - 1])
+            // Both prechecks are folded into one branchless test: XOR is zero only on equality, so
+            // the OR is zero only when both bytes match. Two hard-to-predict branches become one
+            // rarely-taken branch, which matters on data where half the candidates match the first
+            // byte but few survive both checks.
+            if (((Unsafe.Add(ref bufferRef, previousRepetition) ^ firstByte) |
+                 (Unsafe.Add(ref bufferRef, previousRepetition + lastByteOffset) ^ lastByte)) == 0)
             {
-                int comparePosition = inputOffset + 1;
-                previousRepetition++;
-                equalByteCount = 2;
-
-                while (equalByteCount < MaxRepetitionLength)
-                {
-                    previousRepetition++;
-                    comparePosition++;
-
-                    if (_workBuffer[previousRepetition] != _workBuffer[comparePosition])
-                    {
-                        break;
-                    }
-
-                    equalByteCount++;
-                }
+                equalByteCount = 2 + MatchLength(buffer, previousRepetition + 2, inputOffset + 2, MaxRepetitionLength - 2);
 
                 // Take any match at least as long as the best so far. Because the occurrences are
                 // enumerated in ascending order, that yields the most recent one, whose smaller
                 // distance costs fewer bits to encode.
                 if (equalByteCount >= repetitionLength)
                 {
-                    _distance = (uint)(inputOffset - previousRepetition + equalByteCount - 1);
+                    _distance = (uint)(inputOffset - previousRepetition - 1);
                     repetitionLength = equalByteCount;
 
                     // Repetitions longer than 10 bytes are worth the extra search below.
@@ -332,10 +415,13 @@ internal sealed class ImplodeEngine
                     {
                         break;
                     }
+
+                    lastByteOffset = repetitionLength - 1;
+                    lastByte = buffer[inputOffset + lastByteOffset];
                 }
             }
 
-            previousRepetition = _hashOffsets[++hashOffsetIndex];
+            previousRepetition = Unsafe.Add(ref hashOffsetsRef, ++hashOffsetIndex);
 
             if (previousRepetition >= repetitionLimit)
             {
@@ -344,14 +430,15 @@ internal sealed class ImplodeEngine
             }
         }
 
-        // The match is already as long as the format can encode.
+        // The match is already as long as the format can encode. The distance needs no adjustment
+        // here: unlike the original's advancing pointers, the arithmetic above never moved the
+        // start of the match.
         if (equalByteCount == MaxRepetitionLength)
         {
-            _distance--;
             return equalByteCount;
         }
 
-        if (_hashOffsets[hashOffsetIndex + 1] >= repetitionLimit)
+        if (hashOffsets[hashOffsetIndex + 1] >= repetitionLimit)
         {
             return repetitionLength;
         }
@@ -372,17 +459,26 @@ internal sealed class ImplodeEngine
     /// <returns>The length of the best repetition found.</returns>
     private int ExtendRepetition(int inputOffset, int hashOffsetIndex, int repetitionLimit, int repetitionLength)
     {
-        _partialMatchTable[0] = NoMatch;
-        _partialMatchTable[1] = 0;
+        byte[] buffer = _workBuffer;
+        ushort[] hashOffsets = _hashOffsets;
+        ushort[] partialMatchTable = _partialMatchTable;
+
+        // Unchecked reads under the same guarantees as in FindRepetition: the chain terminator
+        // bounds the index, and stored offsets sit well inside the padded buffer.
+        ref byte bufferRef = ref MemoryMarshal.GetArrayDataReference(buffer);
+        ref ushort hashOffsetsRef = ref MemoryMarshal.GetArrayDataReference(hashOffsets);
+
+        partialMatchTable[0] = NoMatch;
+        partialMatchTable[1] = 0;
 
         ushort prefixLength = 0;
         int matchedPrefix = 1;
 
         while (matchedPrefix < repetitionLength)
         {
-            if (_workBuffer[inputOffset + matchedPrefix] != _workBuffer[inputOffset + prefixLength])
+            if (buffer[inputOffset + matchedPrefix] != buffer[inputOffset + prefixLength])
             {
-                prefixLength = _partialMatchTable[prefixLength];
+                prefixLength = partialMatchTable[prefixLength];
 
                 if (prefixLength != NoMatch)
                 {
@@ -392,16 +488,16 @@ internal sealed class ImplodeEngine
 
             // Wraps from NoMatch back to zero, matching the unsigned short arithmetic of the original.
             prefixLength = (ushort)(prefixLength + 1);
-            _partialMatchTable[++matchedPrefix] = prefixLength;
+            partialMatchTable[++matchedPrefix] = prefixLength;
         }
 
-        int previousRepetition = _hashOffsets[hashOffsetIndex];
+        int previousRepetition = hashOffsets[hashOffsetIndex];
         int previousRepetitionEnd = previousRepetition + repetitionLength;
         int candidateLength = repetitionLength;
 
         while (true)
         {
-            candidateLength = _partialMatchTable[candidateLength];
+            candidateLength = partialMatchTable[candidateLength];
 
             if (candidateLength == NoMatch)
             {
@@ -411,7 +507,7 @@ internal sealed class ImplodeEngine
             // Skip occurrences too far back to reach the end of the match already found.
             do
             {
-                previousRepetition = _hashOffsets[++hashOffsetIndex];
+                previousRepetition = Unsafe.Add(ref hashOffsetsRef, ++hashOffsetIndex);
 
                 if (previousRepetition >= repetitionLimit)
                 {
@@ -420,9 +516,10 @@ internal sealed class ImplodeEngine
             }
             while (previousRepetition + candidateLength < previousRepetitionEnd);
 
-            byte preLastByte = _workBuffer[inputOffset + repetitionLength - 2];
+            int preLastByteOffset = repetitionLength - 2;
+            byte preLastByte = buffer[inputOffset + preLastByteOffset];
 
-            if (preLastByte == _workBuffer[previousRepetition + repetitionLength - 2])
+            if (preLastByte == Unsafe.Add(ref bufferRef, previousRepetition + preLastByteOffset))
             {
                 // The candidate reaches past the end of the previous match, so start measuring afresh.
                 if (previousRepetition + candidateLength != previousRepetitionEnd)
@@ -433,33 +530,31 @@ internal sealed class ImplodeEngine
             }
             else
             {
+                byte firstByte = buffer[inputOffset];
+
                 // Find an occurrence whose first and last but one bytes both match.
                 do
                 {
-                    previousRepetition = _hashOffsets[++hashOffsetIndex];
+                    previousRepetition = Unsafe.Add(ref hashOffsetsRef, ++hashOffsetIndex);
 
                     if (previousRepetition >= repetitionLimit)
                     {
                         return repetitionLength;
                     }
                 }
-                while (_workBuffer[previousRepetition + repetitionLength - 2] != preLastByte ||
-                       _workBuffer[previousRepetition] != _workBuffer[inputOffset]);
+                while (((Unsafe.Add(ref bufferRef, previousRepetition + preLastByteOffset) ^ preLastByte) |
+                        (Unsafe.Add(ref bufferRef, previousRepetition) ^ firstByte)) != 0);
 
                 previousRepetitionEnd = previousRepetition + 2;
                 candidateLength = 2;
             }
 
-            // Measure how far the candidate agrees with the input.
-            while (_workBuffer[previousRepetitionEnd] == _workBuffer[inputOffset + candidateLength])
-            {
-                if (++candidateLength >= MaxRepetitionLength)
-                {
-                    break;
-                }
-
-                previousRepetitionEnd++;
-            }
+            // Measure how far the candidate agrees with the input. The byte-at-a-time loop this
+            // replaces advanced previousRepetitionEnd one step less when the cap was hit, but the
+            // capped case returns below before previousRepetitionEnd is read again.
+            int matched = MatchLength(buffer, previousRepetitionEnd, inputOffset + candidateLength, MaxRepetitionLength - candidateLength);
+            candidateLength += matched;
+            previousRepetitionEnd += matched;
 
             if (candidateLength < repetitionLength)
             {
@@ -477,9 +572,9 @@ internal sealed class ImplodeEngine
             // Extend the failure function to cover the now longer match.
             while (matchedPrefix < candidateLength)
             {
-                if (_workBuffer[inputOffset + matchedPrefix] != _workBuffer[inputOffset + prefixLength])
+                if (buffer[inputOffset + matchedPrefix] != buffer[inputOffset + prefixLength])
                 {
-                    prefixLength = _partialMatchTable[prefixLength];
+                    prefixLength = partialMatchTable[prefixLength];
 
                     if (prefixLength != NoMatch)
                     {
@@ -488,7 +583,7 @@ internal sealed class ImplodeEngine
                 }
 
                 prefixLength = (ushort)(prefixLength + 1);
-                _partialMatchTable[++matchedPrefix] = prefixLength;
+                partialMatchTable[++matchedPrefix] = prefixLength;
             }
         }
     }

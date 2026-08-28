@@ -9,7 +9,9 @@ The C sources it was translated from — `implode.c`, `explode.c`, `crc32.c` and
 logic into idiomatic C#, not a reimplementation: it produces and consumes the same byte streams as
 the original, which is the format used by MPQ archives among others.
 
-Targets `net10.0`. No dependencies, no unsafe code.
+Targets `net10.0`. No dependencies, and no `unsafe` blocks — the compressor's hot loops use the
+runtime's `Unsafe`/`MemoryMarshal` helpers for unchecked reads whose bounds are proven by the
+buffer layout, documented at each site.
 
 ## Getting a codec
 
@@ -121,6 +123,34 @@ neither pre- nor post-inverted, so it starts from zero and its results **do not*
   returned four bytes or fewer, which made the check depend on how much the caller happened to hand
   over. A `Stream` may legitimately return a short read with more data still coming, so a stream
   arriving in small pieces would have been rejected as corrupt. Output is unaffected.
+
+## Performance
+
+The compressor's inner loops are tuned without changing a single output byte — every optimization
+was gated on a 589-case corpus of compressed-output hashes staying identical to the straight port:
+
+- Match candidates are measured eight bytes per step: the XOR of two 64-bit loads is zero only when
+  all eight bytes agree, and the trailing-zero count of a non-zero XOR locates the first mismatch.
+  On x86-64 this compiles to unaligned 64-bit loads and the `TZCNT` instruction. A 32-byte AVX2
+  loop was also tried and lost: matches are capped at 0x204 bytes and are usually far shorter, so
+  the wider vectors cost more in setup than they saved.
+- The candidate-scan prechecks fold two byte comparisons into one branchless test, turning two
+  poorly predicted branches into one rarely taken one. On small-alphabet data, where half the
+  candidates pass the first check, this was worth roughly half again as much throughput.
+- The bit writer is an unrolled loop with its cursor in locals rather than the original's recursion.
+
+Median throughput on one x86-64 desktop (4 MB payloads, binary mode, 4096-byte dictionary),
+straight port vs. tuned:
+
+| Payload | Before | After |
+| --- | --- | --- |
+| Repetitive text | 190 MB/s | 310 MB/s |
+| Mixed runs and noise | 105 MB/s | 109 MB/s |
+| Random bytes | 46 MB/s | 47 MB/s |
+| 8-symbol alphabet (worst case) | 7 MB/s | 11 MB/s |
+
+The small-alphabet case is slow by nature: the format's hash chains degenerate there, and honoring
+the original's match selection means walking them in full. Decompression is untouched.
 
 ## License
 
