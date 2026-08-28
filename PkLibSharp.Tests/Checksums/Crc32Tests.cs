@@ -18,7 +18,8 @@ public class Crc32Tests
 
         foreach (byte value in data)
         {
-            uint next = (uint)((value ^ crc) & 0xFF);
+            // byte ^ uint already yields uint, so no cast is needed here.
+            uint next = (value ^ crc) & 0xFF;
 
             for (int bit = 0; bit < 8; bit++)
             {
