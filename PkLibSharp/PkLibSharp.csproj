@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>PkLibSharp</PackageId>
+    <Description>
+      A C# port of the implode and explode methods of the PKWARE Data Compression Library,
+      translated from Ladislav Zezula's PKLib (MIT), which ships as src/pklib inside StormLib.
+    </Description>
+    <Version>1.0.0</Version>
+    <Authors>Alyx Dallagiacomo</Authors>
+    <Copyright>Copyright (c) 2026 Alyx Dallagiacomo; portions Copyright (c) 1999-2013 Ladislav Zezula</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="..\LICENSE" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+</Project>

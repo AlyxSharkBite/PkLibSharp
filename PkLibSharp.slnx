@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="PkLibSharp.Tests/PkLibSharp.Tests.csproj" />
+  <Project Path="PkLibSharp/PkLibSharp.csproj" />
+</Solution>
