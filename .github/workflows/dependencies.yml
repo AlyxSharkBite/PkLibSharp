@@ -44,7 +44,9 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Restore
-        run: dotnet restore
+        # Locked mode: the audit below must run against exactly the package set that was
+        # reviewed and committed, not whatever resolves today.
+        run: dotnet restore --locked-mode
 
       - name: Audit for known-vulnerable packages
         run: |
