@@ -14,7 +14,7 @@
   <ItemGroup>
     <!-- xunit.v3 carries its own Microsoft.Testing.Platform runner, so neither
          Microsoft.NET.Test.Sdk nor the VSTest adapter is needed any more. -->
-    <PackageReference Include="xunit.v3" Version="4.0.0" />
+    <PackageReference Include="xunit.v3" Version="4.0.1" />
   </ItemGroup>
 
   <ItemGroup>
